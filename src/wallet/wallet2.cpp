@@ -9686,6 +9686,60 @@ std::pair<std::set<uint64_t>, size_t> outs_unique(const std::vector<std::vector<
   return std::make_pair(std::move(unique), total);
 }
 
+bool wallet2::repair_global_output_indices(const std::vector<size_t> &transfer_idxs)
+{
+  std::vector<crypto::hash> txids;
+  std::unordered_map<crypto::hash, std::vector<size_t>> by_txid;
+  for (size_t i: transfer_idxs)
+  {
+    if (i >= m_transfers.size())
+      continue;
+    auto it = by_txid.find(m_transfers[i].m_txid);
+    if (it == by_txid.end())
+    {
+      txids.push_back(m_transfers[i].m_txid);
+      by_txid.emplace(m_transfers[i].m_txid, std::vector<size_t>{i});
+    }
+    else
+      it->second.push_back(i);
+  }
+  if (txids.empty())
+    return false;
+
+  bool repaired = false;
+  m_node_rpc_proxy.get_transactions(txids,
+    [&](const cryptonote::COMMAND_RPC_GET_TRANSACTIONS::request&, const cryptonote::COMMAND_RPC_GET_TRANSACTIONS::response &resp, bool r)
+    {
+      if (!r || resp.status != CORE_RPC_STATUS_OK)
+        return;
+      for (const auto &e: resp.txs)
+      {
+        crypto::hash h;
+        if (e.in_pool || !epee::string_tools::hex_to_pod(e.tx_hash, h))
+          continue;
+        const auto it = by_txid.find(h);
+        if (it == by_txid.end())
+          continue;
+        for (size_t i: it->second)
+        {
+          transfer_details &td = m_transfers[i];
+          if (e.output_indices.size() <= td.m_internal_output_index)
+            continue;
+          const uint64_t correct = e.output_indices[td.m_internal_output_index];
+          if (correct == td.m_global_output_index)
+            continue;
+          MWARNING("Correcting global output index for " << td.m_txid << " output " << td.m_internal_output_index
+              << ": " << td.m_global_output_index << " -> " << correct);
+          td.m_global_output_index = correct;
+          repaired = true;
+        }
+      }
+    });
+  if (repaired)
+    store();
+  return repaired;
+}
+//----------------------------------------------------------------------------------------------------
 void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> &outs, const std::vector<size_t> &selected_transfers, size_t fake_outputs_count, bool rct, std::unordered_set<crypto::public_key> &valid_public_keys_cache)
 {
   std::vector<uint64_t> rct_offsets;
@@ -10248,8 +10302,27 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
               if (daemon_resp.outs[i].unlocked)
                 real_out_found = true;
       }
-      THROW_WALLET_EXCEPTION_IF(!real_out_found, error::wallet_internal_error,
-          "Daemon response did not include the requested real output");
+      if (!real_out_found)
+      {
+        // m_global_output_index is taken from /getblocks.bin and stored without any check on its
+        // value, so a daemon that renumbers it leaves the output unspendable for good: the wrong
+        // index is in the cache, switching to an honest node does not help and only
+        // rescan_blockchain repairs it. The index can be re-derived from the transaction id and
+        // the output's position inside it, both of which the wallet keeps, so try that first.
+        // The daemon renumbers its whole answer, so the wrong values are not confined to the
+        // transfers this attempt happened to pick. Asking for the transactions tells the daemon
+        // which ones belong to this wallet, so this is only done on a trusted daemon.
+        bool repaired = false;
+        if (is_trusted_daemon())
+        {
+          std::vector<size_t> all_idxs(m_transfers.size());
+          std::iota(all_idxs.begin(), all_idxs.end(), 0);
+          repaired = repair_global_output_indices(all_idxs);
+        }
+        THROW_WALLET_EXCEPTION(error::wallet_internal_error, repaired
+            ? "Daemon response did not include the requested real output; a wrong output index from an earlier refresh has been corrected, please retry"
+            : "Daemon response did not include the requested real output");
+      }
 
       // pick real out first (it will be sorted when done)
       outs.back().push_back(std::make_tuple(td.m_global_output_index, td.get_public_key(), mask));
