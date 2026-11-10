@@ -159,6 +159,12 @@ using namespace cryptonote;
 
 #define DEFAULT_UNLOCK_TIME (CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE * DIFFICULTY_TARGET_V2)
 #define RECENT_SPEND_WINDOW (15 * DIFFICULTY_TARGET_V2)
+// Upper bound on gamma_picker::pick() calls spent on the decoys of one ring, counting picks
+// outside the wanted range and picks that land on an index already chosen. An honest
+// distribution needs a few dozen, or tens of thousands when a segregation height is set and
+// pre-fork decoys are drawn. A distribution that makes nearly every pick unusable, or keeps
+// returning the same index, ends in an error after a few seconds instead of never.
+#define MAX_GAMMA_PICKS_PER_RING 1000000
 
 static const std::string MULTISIG_SIGNATURE_MAGIC = "SigMultisigPkV1";
 
@@ -1103,6 +1109,19 @@ gamma_picker::gamma_picker(const std::vector<uint64_t> &rct_offsets, double shap
 };
 
 gamma_picker::gamma_picker(const std::vector<uint64_t> &rct_offsets): gamma_picker(rct_offsets, GAMMA_SHAPE, GAMMA_SCALE) {}
+
+uint64_t gamma_picker::pick_in_range(uint64_t lo, uint64_t hi, size_t &budget)
+{
+  while (budget > 0)
+  {
+    --budget;
+    const uint64_t i = pick();
+    if (i >= lo && i < hi)
+      return i;
+  }
+  THROW_WALLET_EXCEPTION(error::get_output_distribution,
+      "Ran out of gamma picks before finding enough decoys in [" + std::to_string(lo) + ", " + std::to_string(hi) + ")");
+}
 
 uint64_t gamma_picker::pick()
 {
@@ -10058,6 +10077,10 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
         // while we still need more mixins
         MDEBUG("Starting gamma picking with " << num_outs
             << ", requested_outputs_count " << requested_outputs_count);
+        // shared by every gamma pick for this ring, including picks that land on an index
+        // already in seen_indices, so a distribution that keeps returning the same index
+        // cannot keep this loop going forever
+        size_t pick_budget = MAX_GAMMA_PICKS_PER_RING;
         while (num_found < requested_outputs_count)
         {
           // if we've gone through every possible output, we've gotten all we can
@@ -10077,17 +10100,17 @@ void wallet2::get_outs(std::vector<std::vector<tools::wallet2::get_outs_entry>> 
             // gamma distribution
             if (num_found -1 < recent_outputs_count + pre_fork_outputs_count)
             {
-              do i = gamma->pick(); while (i >= segregation_limit[amount].first);
+              i = gamma->pick_in_range(0, segregation_limit[amount].first, pick_budget);
               type = "pre-fork gamma";
             }
             else if (num_found -1 < recent_outputs_count + pre_fork_outputs_count + post_fork_outputs_count)
             {
-              do i = gamma->pick(); while (i < segregation_limit[amount].first || i >= num_outs);
+              i = gamma->pick_in_range(segregation_limit[amount].first, num_outs, pick_budget);
               type = "post-fork gamma";
             }
             else
             {
-              do i = gamma->pick(); while (i >= num_outs);
+              i = gamma->pick_in_range(0, num_outs, pick_budget);
               type = "gamma";
             }
           }

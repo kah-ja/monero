@@ -88,6 +88,10 @@ namespace tools
   {
   public:
     uint64_t pick();
+    // Repeat pick() until it returns an index in [lo, hi). Every pick() call counts against
+    // budget, and the call throws once the budget is used up instead of looping forever when
+    // the distribution makes every pick unusable.
+    uint64_t pick_in_range(uint64_t lo, uint64_t hi, size_t &budget);
     gamma_picker(const std::vector<uint64_t> &rct_offsets);
     gamma_picker(const std::vector<uint64_t> &rct_offsets, double shape, double scale);
     uint64_t get_num_rct_outs() const { return num_rct_outputs; }
